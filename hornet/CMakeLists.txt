@@ -19,11 +19,15 @@ include_directories(../primitives)
 include_directories(../externals/cub-1.8.0)
 include_directories(../externals/cpp-btree-master)
 include_directories(../xlib/include)
+include_directories(../externals/cudf)
+
 include_directories(${CUDA_INCLUDE_DIRS})
 
 #set(WARNING_FLAGS ON)
 set(CUB_LIBRARY ON)
 include(../compiler-util/CMakeLists.txt)
+
+include_directories(/home/ogreen/hash-graph/moderngpu-oded/src)
 
 #-------------------------------------------------------------------------------
 file(GLOB_RECURSE CPP_SRCS ${PROJECT_SOURCE_DIR}/src/*.cpp)
@@ -41,6 +45,9 @@ cuda_add_executable(hornet_insert_test	test/HornetInsertTest.cu)
 cuda_add_executable(hornet_delete_test	test/HornetDeleteTest.cu)
 cuda_add_executable(mem_benchmark 		test/MemBenchmark.cu)
 cuda_add_executable(weight_test   		test/WeightTest.cu)
+cuda_add_executable(hornet_2_static   	test/hornet_2_static.cu)
+cuda_add_executable(sort 			   	test/sortTest.cu)
+
 
 target_link_libraries(lb_test       	 	hornet ${CUDA_LIBRARIES})
 target_link_libraries(ptxtest       	 	hornet ${CUDA_LIBRARIES})
@@ -49,6 +56,9 @@ target_link_libraries(hornet_insert_test	hornet ${CUDA_LIBRARIES})
 target_link_libraries(hornet_delete_test	hornet ${CUDA_LIBRARIES})
 target_link_libraries(mem_benchmark 		hornet ${CUDA_LIBRARIES})
 target_link_libraries(weight_test   		hornet ${CUDA_LIBRARIES})
+target_link_libraries(hornet_2_static   	hornet ${CUDA_LIBRARIES})
+target_link_libraries(sort 				   	hornet ${CUDA_LIBRARIES})
+
 
 #cuda_add_executable(data_layout test/DataLayout.cu)
 #cuda_add_executable(csr_test test/CsrTest.cu)

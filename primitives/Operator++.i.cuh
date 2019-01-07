@@ -1,6 +1,7 @@
 #include <Device/Util/Timer.cuh>
 #include <Operator++.cuh>
 
+
 namespace hornets_nest {
 namespace detail {
 
@@ -363,7 +364,7 @@ namespace adj_unions {
             int binary_work_est = u_len*log_v;
             int intersect_work_est = u_len + v_len + log_u;
             //const int WORK_FACTOR = 9999; // force imbalanced-only
-            int BALANCED_WORK_LIMIT = BLOCK_SIZE_OP2*(1<<LOG_OFFSET_BALANCED-1);
+            // int BALANCED_WORK_LIMIT = BLOCK_SIZE_OP2*(1<<LOG_OFFSET_BALANCED-1);
             //int METHOD = ((WORK_FACTOR*intersect_work_est >= binary_work_est) || (intersect_work_est > BALANCED_WORK_LIMIT));
             int METHOD = ((WORK_FACTOR*intersect_work_est >= binary_work_est)); 
             if (!METHOD && u_len <= 1) {
@@ -584,8 +585,29 @@ void forAllEdgesAdjUnionImbalanced(HornetClass &hornet, vid_t* queue, const unsi
     CHECK_CUDA_ERROR
 }
 
+// template<typename Operator>
+// void forAll(size_t size, const Operator& op) {
+//     if (size == 0)
+//         return;
+//     detail::forAllKernel
+//         <<< xlib::ceil_div<BLOCK_SIZE_OP2>(size), BLOCK_SIZE_OP2 >>>
+//         (size, op);
+//     CHECK_CUDA_ERROR
+// }
+
+// template<typename T, typename Operator>
+// void forAll(const TwoLevelQueue<T>& queue, const Operator& op) {
+//     auto size = queue.size();
+//     if (size == 0)
+//         return;
+//     detail::forAllKernel
+//         <<< xlib::ceil_div<BLOCK_SIZE_OP2>(size), BLOCK_SIZE_OP2 >>>
+//         (queue.device_input_ptr(), size, op);
+//     CHECK_CUDA_ERROR
+// }
+
 template<typename Operator>
-void forAll(size_t size, const Operator& op) {
+void forAll(int size, const Operator& op){
     if (size == 0)
         return;
     detail::forAllKernel

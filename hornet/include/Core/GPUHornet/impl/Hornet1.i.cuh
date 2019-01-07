@@ -89,8 +89,8 @@ void HORNET::initialize() noexcept {
     bool   edge_check = std::all_of(edge_init, edge_init + NUM_ETYPES, lamba);
     if (!vertex_check)
         ERROR("Vertex data not initializated");
-    if (!edge_check)
-        ERROR("Edge data not initializated");
+    // if (!edge_check)
+    //     ERROR("Edge data not initializated");
     Timer<DEVICE> TM;
     TM.start();
     //--------------------------------------------------------------------------
