@@ -35,6 +35,9 @@ using namespace std::string_literals;
 
 using HornetGPU = hornets_nest::gpu::Hornet<EMPTY, EMPTY>;
 
+#define CHECK_ERROR(str) \
+    {cudaError_t err; err = cudaGetLastError(); if(err!=0) {fprintf(stderr, "ERROR %s:  %d %s\n", str, err, cudaGetErrorString(err) ); fflush(stderr); exit(0);}}
+
 void exec(int argc, char* argv[]);
 
 /**
@@ -338,7 +341,8 @@ __device__ void iterativeMergeSort(vid_t* array, int32_t length, vid_t* temp) {
     {
       for (int32_t A_start = 0; A_start < array_length; A_start += 2 * currentSubArraySize)
       {
-          int32_t A_end = min(A_start + currentSubArraySize, array_length - 1);
+
+          int32_t A_end = min(A_start + currentSubArraySize, array_length -1);
           int32_t B_start = A_end;
           int32_t B_end = min(A_start + 2 * currentSubArraySize, array_length);
           int32_t A_length = A_end - A_start;
@@ -414,6 +418,29 @@ struct binCount {
   }
 };
 
+__global__ void binCountKernel(vid_t *offset, int32_t *bins, int N){
+    int i = threadIdx.x + blockIdx.x *blockDim.x;
+    if(i>=N)
+    	return;
+
+  	__shared__ int32_t localBins[33];
+  	int id = threadIdx.x;
+  	if(id<33){
+  		localBins[id]=0;
+  	}
+  	__syncthreads();
+
+    int32_t adjSize=offset[i+1]-offset[i];
+    int myBin  = __clz(adjSize);
+
+    atomicAdd(localBins+myBin, 1);
+
+	__syncthreads();
+  	if(id<33){
+    	atomicAdd(bins+id, localBins[id]);
+  	}
+}
+
 
 struct binPrefix {
   int32_t     *bins;
@@ -435,6 +462,18 @@ struct binPrefix {
 
   	}
 };
+
+__global__ void  binPrefixKernel(int32_t     *bins, int32_t     *d_binsPrefix){
+
+    int i = threadIdx.x + blockIdx.x *blockDim.x;
+  	if(i>=1)
+  		return;
+  		d_binsPrefix[0]=0;
+  		for(int b=0; b<33; b++){
+  			d_binsPrefix[b+1]=d_binsPrefix[b]+bins[b];
+  		}
+}
+
 
 struct rebin{
   vid_t     *offset;
@@ -480,21 +519,266 @@ struct rebin{
   }
 };
 
+struct lrbCacheStruct{
+  // vid_t newSize;
+  int   global_pos;
+  vid_t relabelVertex;
+  vid_t start;
+  vid_t stop;
+
+};
+
+template <bool writeStop,bool writeStart,int THREADS>
+__global__ void  rebinKernel(
+  vid_t     *offset,
+  int32_t   *d_binsPrefix,
+  vid_t   *d_reOrg,
+  vid_t     *d_start,
+  vid_t     *d_stop,
+  int N){
+
+    int i = threadIdx.x + blockIdx.x *blockDim.x;
+    if(i>=N)
+      return;
+    // __shared__ lrbCacheStruct lrbCache[THREADS];
+
+
+    __shared__ int32_t localBins[33];
+    __shared__ int32_t localPos[33];
+
+    __shared__ int32_t prefix[33];    
+    int id = threadIdx.x;
+    if(id<33){
+      localBins[id]=0;
+      localPos[id]=0;
+    }
+    __syncthreads();
+
+    int32_t adjSize=offset[i+1]-offset[i];
+    int myBin  = __clz(adjSize);
+
+    int my_pos = atomicAdd(localBins+myBin, 1);
+
+  __syncthreads();
+    if(id<33){
+      localPos[id]=atomicAdd(d_binsPrefix+id, localBins[id]);
+    }
+  __syncthreads();
+
+  #if 0
+
+  // if(id <32){
+  //     typedef cub::WarpScan<int> WarpScan;
+  //     // Allocate WarpScan shared memory for 4 warps
+  //     __shared__ typename WarpScan::TempStorage temp_storage[1];
+  //     // Obtain one input item per thread
+  //     int thread_data = localBins[id];
+  //     // Compute warp-wide prefix sums
+  //     WarpScan(temp_storage[0]).ExclusiveSum(thread_data, thread_data);    
+  //     prefix[id]=thread_data;
+  // }
+
+  // __syncthreads();
+  // if(id==0)
+  //   prefix[32]=prefix[31]+localBins[32];
+
+    if(id==0){
+      prefix[0]=0;
+      for(int p=0; p<32;p++){
+        prefix[p+1]=prefix[p]+localBins[p];
+      }
+    }
+
+    // __syncthreads();
+    if(id<33){
+      localBins[id]=0;
+    }
+
+  __syncthreads();
+
+    int localbinpos = atomicAdd(localBins+myBin, 1);
+
+    lrbCache[localbinpos+prefix[myBin]].relabelVertex = i;
+    if(writeStart)
+      lrbCache[localbinpos+prefix[myBin]].start = offset[i];
+    if(writeStop)
+      lrbCache[localbinpos+prefix[myBin]].stop  = offset[i+1];
+    lrbCache[localbinpos+prefix[myBin]].global_pos = localbinpos+localPos[myBin];
+
+
+  __syncthreads();
+
+    int writePos = lrbCache[threadIdx.x].global_pos;
+
+    d_reOrg[writePos] = lrbCache[threadIdx.x].relabelVertex;
+    if(writeStart)
+      d_start[writePos] = lrbCache[threadIdx.x].start;
+    if(writeStop)
+      d_stop [writePos] = lrbCache[threadIdx.x].stop;
+
+  #else
+    // int pos = atomicAdd(localPos+myBin, 1);
+    int pos = localPos[myBin]+my_pos;
+    d_reOrg[pos]=i;
+    // newSize[pos]=adjSize;
+    // if(writeStart)
+    //   d_start[pos]=offset[i];
+    // if(writeStop)
+    //   d_stop[pos] =offset[i+1];
+  #endif
+}
+
+
+__global__ void  reGraphSizes(
+  vid_t   *originalOffset ,
+  vid_t   *d_reOrg,  
+  vid_t   *newSizes,
+  int N)
+{
+    int i = threadIdx.x + blockIdx.x *blockDim.x;
+    if(i>=N)
+      return;
+
+    vid_t v = d_reOrg[i];
+    int32_t adjSize=originalOffset[v+1]-originalOffset[v];
+    newSizes[i]=adjSize;
+}
+
+__global__ void  reGraph(
+  vid_t   *originalOffset,
+  vid_t   *newOffset,
+  vid_t   *d_reOrg,
+  vid_t   *originalEdges,
+  vid_t   *newEdges,
+  int N){
+
+    int i = threadIdx.x + blockIdx.x *blockDim.x;
+    if(i>=N)
+      return;
+    int32_t adjSize=newOffset[i+1]-newOffset[i];
+    
+    vid_t v = d_reOrg[i];
+
+    if(adjSize!=(originalOffset[v+1]-originalOffset[v]))
+      printf("*");
+
+    for(int a=0; a<adjSize;a++){
+      newEdges[newOffset[i]+a]=originalEdges[originalOffset[v]+a];
+    }
+
+}
+
+
+
 
 // #define BUBBLE(temp, val1,val2 ) temp=val1; val1=val2; val2=temp;
 __device__ void bubbleSort(int32_t size, vid_t *edges){
   vid_t temp; 
   for(int32_t i=0; i<(size-1); i++){
-	int32_t min_idx=i;
-	for(int32_t j=i+1; j<(size); j++){
-	  if(edges[j]<edges[min_idx])
-		min_idx=j;
-	}
-	temp          = edges[min_idx];
-	edges[min_idx]  = edges[i];
-	edges[i]        = temp;
+  	int32_t min_idx=i;
+	 for(int32_t j=i+1; j<(size); j++){
+	    if(edges[j]<edges[min_idx])
+	   	  min_idx=j;
+	 }
+  	temp          = edges[min_idx];
+  	edges[min_idx]  = edges[i];
+  	edges[i]        = temp;
   }
+  // int32_t sizeTemp=size;
+
+  // for(int32_t i=0; i<(sizeTemp-1); i++,sizeTemp--){
+  //   int32_t min_idx=i;
+  //   int32_t max_idx=sizeTemp-1;
+
+  //  for(int32_t j=i; j<(sizeTemp); j++){
+  //     if(edges[j]<edges[min_idx])
+  //       min_idx=j;
+  //     if(edges[j]>edges[max_idx])
+  //       max_idx=j;
+  //  }
+  //   temp            = edges[min_idx];
+  //   edges[min_idx]  = edges[i];
+  //   edges[i]        = temp;
+
+  //   temp            = edges[max_idx];
+  //   edges[max_idx]  = edges[sizeTemp-1];
+  //   edges[sizeTemp-1] = temp;
+
+  // }
+
 }
+
+
+// A utility function to swap two elements 
+__device__ void swap ( int* a, int* b ) 
+{ 
+    int t = *a; 
+    *a = *b; 
+    *b = t; 
+} 
+  
+/* This function is same in both iterative and recursive*/
+__device__ int partition (int arr[], int l, int h) 
+{ 
+    int x = arr[h]; 
+    int i = (l - 1); 
+  
+    for (int j = l; j <= h- 1; j++) 
+    { 
+        if (arr[j] <= x) 
+        { 
+            i++; 
+            swap (&arr[i], &arr[j]); 
+        } 
+    } 
+    swap (&arr[i + 1], &arr[h]); 
+    return (i + 1); 
+} 
+  
+/* A[] --> Array to be sorted,  
+   l  --> Starting index,  
+   h  --> Ending index */
+__device__ void quickSortIterative (int arr[], int l, int h) 
+{ 
+    // Create an auxiliary stack 
+    // int stack[ h - l + 1 ]; 
+    int stack[ 32 ]; // elements will never be bigger than 32
+   
+    // initialize top of stack 
+    int top = -1; 
+  
+    // push initial values of l and h to stack 
+    stack[ ++top ] = l; 
+    stack[ ++top ] = h; 
+  
+    // Keep popping from stack while is not empty 
+    while ( top >= 0 ) 
+    { 
+        // Pop h and l 
+        h = stack[ top-- ]; 
+        l = stack[ top-- ]; 
+  
+        // Set pivot element at its correct position 
+        // in sorted array 
+        int p = partition( arr, l, h ); 
+  
+        // If there are elements on left side of pivot, 
+        // then push left side to stack 
+        if ( p-1 > l ) 
+        { 
+            stack[ ++top ] = l; 
+            stack[ ++top ] = p - 1; 
+        } 
+  
+        // If there are elements on right side of pivot, 
+        // then push right side to stack 
+        if ( p+1 < h ) 
+        { 
+            stack[ ++top ] = p + 1; 
+            stack[ ++top ] = h; 
+        } 
+    } 
+} 
 
 
 struct sortSmall{
@@ -522,39 +806,92 @@ struct sortSmall{
   		return;
   	}
 
+    #if 0
+      int32_t temp1[32],temp2[32];
+      for(int32_t d=0; d<adjSize;d++){
+      	temp1[d]=edges[offset[v]+d];
+      }
 
-    // int32_t temp1[32],temp2[32];
- //    for(int32_t d=0; d<adjSize;d++){
- //    	temp1[d]=edges[offset[v]+d];
- //    }
+    	iterativeMergeSort(temp1, adjSize,temp2);
 
-	// iterativeMergeSort(temp1, adjSize,temp2);
+      for(int32_t d=0; d<adjSize;d++){
+      	newEdges[offset[v]+d]=temp1[d];
+      }
+    #else
 
- //    for(int32_t d=0; d<adjSize;d++){
- //    	newEdges[offset[v]+d]=temp1[d];
- //    }
+   //  for(int32_t d=0; d<adjSize;d++){
+   //  	newEdges[offset[v]+d]=edges[offset[v]+d];
+  	// }
+
+    // quickSortIterative(newEdges+offset[v], 0,adjSize-1);
+    // bubbleSort(adjSize,newEdges+offset[v]);
+
+    int32_t temp1[32];
 
     for(int32_t d=0; d<adjSize;d++){
-    	newEdges[offset[v]+d]=edges[offset[v]+d];
-	}
+     temp1[d]=edges[offset[v]+d];
+    }
 
-    bubbleSort(adjSize,newEdges+offset[v]);
+    bubbleSort(adjSize,temp1);
 
- //    int32_t temp1[32];
+    for(int32_t d=0; d<adjSize;d++){
+     newEdges[offset[v]+d]=temp1[d];
+    }
 
- //    for(int32_t d=0; d<adjSize;d++){
- //    	temp1[d]=edges[offset[v]+d];
-	// }
 
- //    bubbleSort(adjSize,temp1);
 
- //    for(int32_t d=0; d<adjSize;d++){
- //    	newEdges[offset[v]+d]=temp1[d];
-	// }
+    #endif
+
 
 
   }
 };
+
+
+
+__global__ void sortSmallKernel(
+  vid_t   *edges,
+  vid_t   *newEdges,
+  vid_t   *d_reOrg,
+  vid_t     *offset,
+  int32_t pos,
+  int32_t N){
+    int i=threadIdx.x+blockIdx.x*blockDim.x;
+    if(i>=N)
+      return;
+    vid_t v=d_reOrg[i+pos];
+
+    // int32_t adjSize=d_stop[i+pos]-d_start[i+pos];
+
+
+    int32_t adjSize=offset[v+1]-offset[v];
+    if(adjSize==0){
+      return;
+    }
+    else if (adjSize==1){
+      newEdges[offset[v]]=edges[offset[v]]; 
+      return;
+    }
+
+  //   for(int32_t d=0; d<adjSize;d++){
+  //     newEdges[offset[v]+d]=edges[offset[v]+d];
+  // }
+
+    int32_t temp1[32];
+
+    for(int32_t d=0; d<adjSize;d++){
+     temp1[d]=edges[offset[v]+d];
+    }
+
+    bubbleSort(adjSize,temp1);
+
+    for(int32_t d=0; d<adjSize;d++){
+     newEdges[offset[v]+d]=temp1[d];
+    }
+
+}
+
+
 
 template <int threads, int elements_per_thread,int  total_elements>
 __global__ void sortOneSize(
@@ -563,7 +900,7 @@ __global__ void sortOneSize(
 		vid_t   *offset,
 		vid_t  	*edges,
 		vid_t  	*newEdges,
-		vid_t   *newSize,
+		// vid_t   *newSize,
 		vid_t   *d_start,
 		vid_t   *d_stop
 	  )
@@ -756,6 +1093,8 @@ struct printOneAfter{
 };
 
 
+#include "bb_segsort.h"
+
 
 void exec(int argc, char* argv[]) {
     using namespace graph::structure_prop;
@@ -890,7 +1229,7 @@ void exec(int argc, char* argv[]) {
 
     	// forAll (1,printOneAfter{(vid_t*)cols[0].data,(vid_t*)cols[1].data});
 
-    	forAll (1,printOneBefore{(vid_t*)cols[0].data,(vid_t*)cols[1].data});
+    	// forAll (1,printOneBefore{(vid_t*)cols[0].data,(vid_t*)cols[1].data});
 
 	    TM.start();
 
@@ -909,12 +1248,17 @@ void exec(int argc, char* argv[]) {
 	    TM.stop();
 	    TM.print("Time to sort CSR using Cub's DeviceSegmentedRadixSort");
 
-    	forAll (1,printOneAfter{(vid_t*)cols[0].data,(vid_t*)extraStorage.data});
+    	// forAll (1,printOneAfter{(vid_t*)cols[0].data,(vid_t*)extraStorage.data});
 
 
 	    vid_t *d_start,*d_stop;
 		gpu::allocate((vid_t*&)(d_start),nV);
 		gpu::allocate((vid_t*&)(d_stop),nV);
+
+
+    // CHECK_ERROR("CUB RADIX PROBLEM");
+
+    // gpu::memsetZero((vid_t*)extraStorage.data,nE);
 
 		int sortRadix=20;
 		int32_t pos=0;
@@ -926,12 +1270,28 @@ void exec(int argc, char* argv[]) {
 	    TM.start();
 		    gpu::memsetZero(d_bins, 33);
 		    gpu::memsetZero(d_newSize, nV+2);
-		    forAll (nV,binCount{(vid_t*)cols[0].data, d_bins});
-		    forAll (1,binPrefix{d_bins,d_binsPrefix});
+			
+		    // forAll (nV,binCount{(vid_t*)cols[0].data, d_bins});
 
-		    cudaMemcpy(d_binsPrefixTemp,d_binsPrefix,sizeof(int32_t)*34, cudaMemcpyDeviceToDevice);
+			int binCountBlocks = nV/256+((nV%256)?1:0);		    
+		    binCountKernel <<<binCountBlocks,256>>> ((vid_t*)cols[0].data, d_bins,nV);
 
-		    forAll (nV,rebin{(vid_t*)cols[0].data,d_binsPrefixTemp,d_reOrg,d_newSize,d_start,d_stop});
+		    // forAll (1,binPrefix{d_bins,d_binsPrefix});
+
+		    binPrefixKernel <<<1,32>>> (d_bins,d_binsPrefix);
+
+		 
+
+	        cudaMemcpy(d_binsPrefixTemp,d_binsPrefix,sizeof(int32_t)*34, cudaMemcpyDeviceToDevice);
+    	    // forAll (nV,rebin{(vid_t*)cols[0].data,d_binsPrefixTemp,d_reOrg,d_newSize,d_start,d_stop});
+
+            const int RB_BLOCK_SIZE = 1024;
+            int rebinblocks = (nV)/RB_BLOCK_SIZE + (((nV)%RB_BLOCK_SIZE)?1:0);
+
+            rebinKernel<false,false,RB_BLOCK_SIZE><<<rebinblocks,RB_BLOCK_SIZE>>>((vid_t*)cols[0].data,d_binsPrefixTemp,d_reOrg,/*d_newSize,*/d_start,d_stop,nV);
+
+
+
 
 		    cudaMemcpy(&pos,d_binsPrefix+sortRadix,sizeof(int32_t), cudaMemcpyDeviceToHost);
 		    cudaMemcpy(&posSmall,d_binsPrefix+sortRadixSmall,sizeof(int32_t), cudaMemcpyDeviceToHost);
@@ -950,38 +1310,79 @@ void exec(int argc, char* argv[]) {
 	    	nE, pos, d_start, d_stop);
 		    cudaFree(d_temp_storage);
 
-
-
 	    TM.stop();
 	    TM.print("Time to sort with LRB");
+      // printf("CUB SEGMENTED SORT DISABLED\n");
+
+      CHECK_ERROR("LRB KERNEL FAILURE111");
+
+
+
+
+
+    CHECK_ERROR("LRB KERNEL FAILURE");
+
+    cudaStream_t streams[9];
+    for(int i=0;i<9; i++)
+      cudaStreamCreate ( &(streams[i]));
+
 
 	    TM.start();
 
 		    cudaMemcpy(h_binsPrefix,d_binsPrefix,sizeof(int32_t)*34, cudaMemcpyDeviceToHost);
 
-		    // for(int e=1; e<34; e++)
-		    // 	printf("%d, %d\n",33-e, h_binsPrefix[e]- h_binsPrefix[e-1]);
+// ?		    for(int e=1; e<34; e++)
+		    	// printf("%d, %d\n",33-e, h_binsPrefix[e]- h_binsPrefix[e-1]);
 
 		    if(h_binsPrefix[21]-h_binsPrefix[20]>0)
-			    sortOneSize<256,16,4096>	<<<h_binsPrefix[21]-h_binsPrefix[20],256>>>		(h_binsPrefix[20],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize,d_start,d_stop);
+          sortOneSize<128,32,4096>  <<<h_binsPrefix[21]-h_binsPrefix[20],128, 0, streams[8]>>>    (h_binsPrefix[20],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+			    // sortOneSize<256,16,4096>	<<<h_binsPrefix[21]-h_binsPrefix[20],256, 0, streams[8]>>>		(h_binsPrefix[20],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
 		    if(h_binsPrefix[22]-h_binsPrefix[21]>0)
-			    sortOneSize<128,16,2048>	<<<h_binsPrefix[22]-h_binsPrefix[21],128>>>		(h_binsPrefix[21],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize,d_start,d_stop);
+          sortOneSize<32,64,2048>  <<<h_binsPrefix[22]-h_binsPrefix[21],32, 0, streams[7]>>>    (h_binsPrefix[21],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+          // sortOneSize<128,16,2048>  <<<h_binsPrefix[22]-h_binsPrefix[21],128, 0, streams[7]>>>    (h_binsPrefix[21],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
 		    if(h_binsPrefix[23]-h_binsPrefix[22]>0)
-			    sortOneSize<128,8,1024>		<<<h_binsPrefix[23]-h_binsPrefix[22],128>>>		(h_binsPrefix[22],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize,d_start,d_stop);
+          sortOneSize<32,32,1024>   <<<h_binsPrefix[23]-h_binsPrefix[22],32, 0, streams[6]>>>    (h_binsPrefix[22],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+          // sortOneSize<128,8,1024>   <<<h_binsPrefix[23]-h_binsPrefix[22],128, 0, streams[6]>>>    (h_binsPrefix[22],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
 		    if(h_binsPrefix[24]-h_binsPrefix[23]>0)
-			    sortOneSize<128,4,512>		<<<h_binsPrefix[24]-h_binsPrefix[23],128>>>		(h_binsPrefix[23],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize,d_start,d_stop);
+          sortOneSize<32,16,512>    <<<h_binsPrefix[24]-h_binsPrefix[23],32, 0, streams[5]>>>    (h_binsPrefix[23],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+          // sortOneSize<128,4,512>    <<<h_binsPrefix[24]-h_binsPrefix[23],128, 0, streams[5]>>>    (h_binsPrefix[23],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
 		    if(h_binsPrefix[25]-h_binsPrefix[24]>0)
-			    sortOneSize<64,4,256>		<<<h_binsPrefix[25]-h_binsPrefix[24],64>>>		(h_binsPrefix[24],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize,d_start,d_stop);
+          sortOneSize<32,8,256>   <<<h_binsPrefix[25]-h_binsPrefix[24],32, 0, streams[4]>>>   (h_binsPrefix[24],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+          // sortOneSize<64,4,256>   <<<h_binsPrefix[25]-h_binsPrefix[24],64, 0, streams[4]>>>   (h_binsPrefix[24],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
 		    if(h_binsPrefix[26]-h_binsPrefix[25]>0)
-			    sortOneSize<64,2,128>		<<<h_binsPrefix[26]-h_binsPrefix[25],64>>>		(h_binsPrefix[25],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize,d_start,d_stop);
+          sortOneSize<32,4,128>   <<<h_binsPrefix[26]-h_binsPrefix[25],32, 0, streams[3]>>>   (h_binsPrefix[25],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+          // sortOneSize<64,2,128>   <<<h_binsPrefix[26]-h_binsPrefix[25],64, 0, streams[3]>>>   (h_binsPrefix[25],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
 		    if(h_binsPrefix[27]-h_binsPrefix[26]>0)
-			    sortOneSize<64,1,64>		<<<h_binsPrefix[27]-h_binsPrefix[26],64>>>		(h_binsPrefix[26],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize,d_start,d_stop);
+          sortOneSize<32,2,64>    <<<h_binsPrefix[27]-h_binsPrefix[26],32, 0, streams[2]>>>   (h_binsPrefix[26],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+          // sortOneSize<64,1,64>    <<<h_binsPrefix[27]-h_binsPrefix[26],64, 0, streams[2]>>>   (h_binsPrefix[26],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
 		    if(h_binsPrefix[28]-h_binsPrefix[27]>0)
-			    sortOneSize<32,1,32>		<<<h_binsPrefix[28]-h_binsPrefix[27],32>>>		(h_binsPrefix[27],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize,d_start,d_stop);
+			    sortOneSize<32,1,32>		<<<h_binsPrefix[28]-h_binsPrefix[27],32, 0, streams[1]>>>		(h_binsPrefix[27],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+
+        // if(h_binsPrefix[30]-h_binsPrefix[28]>0)
+        //   sortOneSize<32,1,32>    <<<h_binsPrefix[30]-h_binsPrefix[28],32, 0, streams[0]>>>   (h_binsPrefix[28],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+
+        if(h_binsPrefix[31]-posSmall>0){
+          int blocks = (h_binsPrefix[31]-posSmall)/32 + (((h_binsPrefix[31]-posSmall)%32)?1:0);
+          sortSmallKernel<<<blocks,32, 0, streams[0]>>>((vid_t*)cols[1].data,(vid_t*)extraStorage.data,d_reOrg,(vid_t*)cols[0].data,posSmall,h_binsPrefix[31]-posSmall);
+
+          // sortOneSize<32,1,32>    <<<h_binsPrefix[30]-h_binsPrefix[28],32, 0, streams[0]>>>   (h_binsPrefix[28],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,/*d_newSize,*/d_start,d_stop);
+        }
+
+      // if(nV-posSmall>0){
+
+      // }
 
 
-			if(nV-posSmall>0)
-			    forAll (nV-posSmall,sortSmall{(vid_t*)cols[1].data,(vid_t*)extraStorage.data,d_reOrg,(vid_t*)cols[0].data,posSmall});
+
+			// if(nV-posSmall>0)
+			//     forAll (nV-posSmall,sortSmall{(vid_t*)cols[1].data,(vid_t*)extraStorage.data,d_reOrg,(vid_t*)cols[0].data,posSmall});
+
+      // if(nV-posSmall>0){
+      //     int blocks = (nV-posSmall)/256 + (((nV-posSmall)%256)?1:0);
+      //     sortSmallKernel<<<blocks,256, 0, streams[0]>>>((vid_t*)cols[1].data,(vid_t*)extraStorage.data,d_reOrg,(vid_t*)cols[0].data,posSmall,nV-posSmall);
+
+      // }
+
 
 ///////		    // sortOneSize<32,1,16>	<<<h_binsPrefix[28]-h_binsPrefix[27],32>>>(h_binsPrefix[27],d_reOrg,(vid_t*)cols[0].data,(vid_t*)cols[1].data, (vid_t*)extraStorage.data,d_newSize);
 
@@ -993,6 +1394,87 @@ void exec(int argc, char* argv[]) {
 	    // int x;
 	    // scanf("%d",&x);
 
+
+      vid_t *d_inputKeys,*d_inputWeights,*d_inputSegs;
+
+
+      gpu::allocate((vid_t*&)(d_inputKeys),nE);
+      gpu::allocate((vid_t*&)(d_inputWeights),nE);
+      gpu::allocate((vid_t*&)(d_inputSegs),nV+1);
+
+      cudaMemcpy(d_inputKeys,(vid_t*)cols[1].data,sizeof(vid_t)*nE,cudaMemcpyDeviceToDevice);
+      cudaMemcpy(d_inputWeights,(vid_t*)cols[1].data,sizeof(vid_t)*nE,cudaMemcpyDeviceToDevice);
+      cudaMemcpy(d_inputSegs,(vid_t*)cols[0].data,sizeof(vid_t)*(nV+1),cudaMemcpyDeviceToDevice);
+
+      TM.start();
+
+      // bb_segsort(d_inputKeys,d_inputWeights,nE,d_inputSegs,nV); 
+
+
+      TM.stop();
+      TM.print("bb_segsort");
+
+
+
+
+
+          TM.start();
+          {
+
+            const int RB_BLOCK_SIZE = 1024;
+            int rebinblocks = (nV)/RB_BLOCK_SIZE + (((nV)%RB_BLOCK_SIZE)?1:0);
+            cudaMemcpy(d_binsPrefixTemp,d_binsPrefix,sizeof(int32_t)*34, cudaMemcpyDeviceToDevice);
+
+            rebinKernel<false,false,RB_BLOCK_SIZE><<<rebinblocks,RB_BLOCK_SIZE>>>((vid_t*)cols[0].data,d_binsPrefixTemp,d_reOrg,/*d_newSize,*/d_start,d_stop,nV);
+          }
+          TM.stop();
+          TM.print("Only LRB");
+
+
+          vid_t *reGraphEdges,*reGraphOffset,*reGraphSizesArray;
+          gpu::allocate((vid_t*&)(reGraphEdges),nE+1);
+          gpu::allocate((vid_t*&)(reGraphOffset),nV+1);
+          gpu::allocate((vid_t*&)(reGraphSizesArray),nV+1);
+
+          reGraphSizes<<<rebinblocks,RB_BLOCK_SIZE>>>((vid_t*)cols[0].data,d_reOrg,reGraphSizesArray,nV);
+
+          void *_d_temp_storage_regraph=nullptr; size_t _temp_storage_bytes_regraph=0;
+          _d_temp_storage_regraph=nullptr; _temp_storage_bytes_regraph=0;
+          cub::DeviceScan::ExclusiveSum(_d_temp_storage_regraph, _temp_storage_bytes_regraph,reGraphSizesArray, reGraphOffset, hornet_gpu.nV()+1);
+          cudaMalloc(&_d_temp_storage_regraph, _temp_storage_bytes_regraph);
+          cub::DeviceScan::ExclusiveSum(_d_temp_storage_regraph, _temp_storage_bytes_regraph,reGraphSizesArray, reGraphOffset, hornet_gpu.nV()+1);
+          gpu::free(_d_temp_storage_regraph);
+
+
+
+          reGraph<<<rebinblocks,RB_BLOCK_SIZE>>>((vid_t*)cols[0].data,reGraphOffset,d_reOrg,(vid_t*)cols[1].data,reGraphEdges,nV);
+
+          TM.stop();
+          TM.print("Regraph LRB");
+
+      vid_t edgesToSort;
+            cudaMemcpy(&edgesToSort,reGraphOffset+pos,sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+
+      TM.start();
+
+      // segmented_sort((vid_t*)reGraphEdges, edgesToSort, reGraphOffset, pos, less_equal_t<vid_t>(), context);
+      segmented_sort((vid_t*)reGraphEdges, nE, reGraphOffset, nV, less_equal_t<vid_t>(), context);
+
+
+      TM.stop();
+      TM.print("Moderngpu SegmentSort - reordered graph");
+
+
+
+
+
+
+
+
+
+
+
 	    fflush(stdout);
 
 	    printf("The number of edges is %d %d\n", nE, h_binsPrefix[33]);
@@ -1000,7 +1482,8 @@ void exec(int argc, char* argv[]) {
 	    cudaMallocManaged((void**)&countIdentical,sizeof(int));
 	    *countIdentical=0;
 		// forAll (nE,compareEdges{(vid_t*)extraStorage.data,modernGPUref,countIdentical});
-		// forAll (nE,compareEdges{modernGPUref,modernGPUref,countIdentical});
+    // forAll (nE,compareEdges{modernGPUref,d_inputKeys,countIdentical});
+
 	    fflush(stdout);
 
 		printf("Number of identical is %d\n",*countIdentical);
@@ -1011,9 +1494,16 @@ void exec(int argc, char* argv[]) {
 	    // printf("The number of adjacency lists sorted is %d\n",pos+ (nV-posSmall));
 
 			void *_d_temp_storage=nullptr; size_t _temp_storage_bytes=0;
-			cub::DeviceScan::ExclusiveSum(_d_temp_storage, _temp_storage_bytes,d_newSize, d_newOffset, nV+1);
+			cub::DeviceScan::ExclusiveSum(_d_temp_storage, _temp_storage_bytes,/*d_newSize,*/  (vid_t*)cols[0].data,d_newOffset, nV+1);
 			cudaMalloc(&_d_temp_storage, _temp_storage_bytes);
-			cub::DeviceScan::ExclusiveSum(_d_temp_storage, _temp_storage_bytes,d_newSize, d_newOffset, nV+1);
+
+      TM.start();
+			cub::DeviceScan::ExclusiveSum(_d_temp_storage, _temp_storage_bytes,/*d_newSize,*/ (vid_t*)cols[0].data,d_newOffset, nV+1);
+      cudaDeviceSynchronize();
+      TM.stop();
+      TM.print("Only PPSUM");
+
+
 			gpu::free(_d_temp_storage);
 
 		int32_t sortedEdges=0;
@@ -1023,11 +1513,28 @@ void exec(int argc, char* argv[]) {
 	    printf("The number of sorted edges is %d\n",sortedEdges);
 
 
-	    gpu::free(modernGPUref);
-	    gpu::free(d_start);
-	    gpu::free(d_stop);	    
-	    gpu::free(d_newOffset);
-	    gpu::free(d_newSize);
+
+          gpu::free(reGraphSizesArray);
+
+          gpu::free(reGraphEdges);
+          gpu::free(reGraphOffset);
+
+
+
+      gpu::free(d_inputKeys);     
+      gpu::free(d_inputWeights);
+      gpu::free(d_inputSegs);
+
+
+
+      gpu::free(modernGPUref);
+      gpu::free(d_start);
+      gpu::free(d_stop);      
+      gpu::free(d_newOffset);
+      gpu::free(d_newSize);
+
+
+
 		gpu::free(d_bins);
 		gpu::free(d_binsPrefix);
 		gpu::free(d_binsPrefixTemp);

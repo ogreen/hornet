@@ -66,19 +66,19 @@ void printKernel(HornetDevice hornet) {
     cout << "\n";*/
 }
 
-template<unsigned BLOCK_SIZE>
-__global__
-void CSRtoCOOKernel(const eoff_t* __restrict__ csr_offsets,
-                    vid_t                      nV,
-                    vid_t*        __restrict__ coo_src) {
-    __shared__ int smem[xlib::smem_per_block<int ,BLOCK_SIZE>()];
+// template<unsigned BLOCK_SIZE>
+// __global__
+// void CSRtoCOOKernel(const eoff_t* __restrict__ csr_offsets,
+//                     vid_t                      nV,
+//                     vid_t*        __restrict__ coo_src) {
+//     __shared__ int smem[xlib::smem_per_block<int ,BLOCK_SIZE>()];
 
-    const auto& lambda = [&](int pos, eoff_t offset) {
-                            eoff_t   index = csr_offsets[pos] + offset;
-                            coo_src[index] = pos;
-                        };
-    xlib::binarySearchLB<BLOCK_SIZE>(csr_offsets, nV, smem, lambda);
-}
+//     const auto& lambda = [&](int pos, eoff_t offset) {
+//                             eoff_t   index = csr_offsets[pos] + offset;
+//                             coo_src[index] = pos;
+//                         };
+//     xlib::binarySearchLB<BLOCK_SIZE>(csr_offsets, nV, smem, lambda);
+// }
 
 template<typename HornetDevice>
 __global__ void checkSortedKernel(HornetDevice hornet) {

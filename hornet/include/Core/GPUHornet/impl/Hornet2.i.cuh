@@ -69,9 +69,9 @@ void HORNET::transpose() noexcept {
     cuMemcpyToDevice(_csr_edges, _nE, d_coo_dst);
     cuMemcpyToDevice(0, d_counts_out + _nV);
 
-    CSRtoCOOKernel<BLOCK_SIZE>
-        <<< xlib::ceil_div(_nV, BLOCK_SIZE), BLOCK_SIZE >>>
-        (d_csr_offsets, _nV, d_coo_dst);
+    // CSRtoCOOKernel<BLOCK_SIZE>
+    //     <<< xlib::ceil_div(_nV, BLOCK_SIZE), BLOCK_SIZE >>>
+    //     (d_csr_offsets, _nV, d_coo_dst);
 
     xlib::CubSortByKey<vid_t, vid_t>::srun(d_coo_dst, d_coo_src, _nE,
                                            d_coo_dst_out, d_coo_src_out,
