@@ -46,8 +46,8 @@ namespace hornets_nest {
 
 using HornetGraph = gpu::Hornet<EMPTY, EMPTY>;
 
-using paths_t = degree_t;
-using bc_t = float;
+using bc_t = double;
+using paths_t = unsigned long long int;
 
 struct BCData {
     vid_t *d;
@@ -74,7 +74,11 @@ public:
     void release()  override;
     bool validate() override;
 
-    BCData bc_data();
+    BCData bc_data() {return hd_BCData;};
+
+    bc_t*    getBCScores();
+    paths_t* getSigmas();
+    bc_t*    getDeltas();
 
 
 
