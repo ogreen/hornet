@@ -582,7 +582,7 @@ void forAllEdgesAdjUnionImbalanced(HornetClass &hornet, vid_t* queue, const unsi
 }
 
 template<typename Operator>
-void forAll(size_t size, const Operator& op) {
+void forAll(int size, const Operator& op){
     if (size == 0)
         return;
     detail::forAllKernel
@@ -601,6 +601,7 @@ void forAll(const TwoLevelQueue<T>& queue, const Operator& op) {
         (queue.device_input_ptr(), size, op);
     CHECK_CUDA_ERROR
 }
+
 
 template<typename HornetClass, typename T, typename Operator>
 void forAllVertexPairs(HornetClass&            hornet,
